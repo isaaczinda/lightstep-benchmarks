@@ -10,6 +10,8 @@ import os
 import numpy as np
 import logging
 import argparse
+import psutil
+from threading import Thread, Lock
 
 CONTROLLER_PORT = 8023
 
@@ -27,7 +29,7 @@ This function take dictionaries of that format and makes them normal. """
 def _format_query_json(query_dict):
     normal_dict = {}
     for key in query_dict:
-        if len(query_dict[key]) == 1:
+        if len(query_dict[key]) == 1 and 'List' not in key:
             normal_dict[key] = query_dict[key][0]
         else:
             normal_dict[key] = query_dict[key]
@@ -107,7 +109,6 @@ class Command:
     def __init__(
             self,
             trace=True,
-            with_satellites=True,
             sleep=100,
             sleep_interval=10**8,
             work=1000,
@@ -118,7 +119,6 @@ class Command:
         self._trace = trace
         self._sleep = sleep
         self._sleep_interval = sleep_interval # 1ms
-        self._with_satellites = with_satellites
         self._exit = exit
         self._work = work
         self._repeat = repeat
@@ -127,10 +127,6 @@ class Command:
     @staticmethod
     def exit():
         return Command(0, exit=True)
-
-    @property
-    def with_satellites(self):
-        return self._with_satellites
 
     def to_dict(self):
         return {
@@ -217,12 +213,52 @@ class Result:
     def cpu_usage(self):
         return self.program_time / self.clock_time
 
+class ClientProcess(subprocess.Popen):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # these are locked because they are accessed from two threads
+        self._lock = Lock()
+        self._cpu_list = []
+        self._memory_list = []
+
+        self._save_stats_thread = Thread(target=self._save_stats, args=(self,))
+        self._save_stats_thread.start()
+
+    @property
+    def cpu_list(self):
+        with self._lock:
+            self._cpu_list.copy()
+
+    @property
+    def memory_list(self):
+        with self._lock:
+            self._memory_list.copy()
+
+    def _save_stats(self):
+        resource_monitor = psutil.Process(pid=self.pid)
+        resource_monitor.cpu_percent() # throw away process CPU usage so far
+
+        while True:
+            time.sleep(1)
+
+            # if the underlying process is no longer running, don't modify cpu or memory
+            if self.poll() != None:
+                return
+
+            cpu_percent = resource_monitor.cpu_percent()
+            memory_usage = resource_monitor.memory_info()[0]
+
+            with self._lock:
+                self._cpu_list.append(cpu_percent)
+                self._memory_list.append(memory_usage)
+
 
 class Controller:
     def __init__(self, client_name, target_cpu_usage=.7):
         if client_name not in client_args:
             raise Exception("Invalid client name. Did you forget to register your client?")
-        
+
         self.client_startup_args = client_args[client_name]
         self.client_name = client_name
 
@@ -335,7 +371,7 @@ class Controller:
         # startup test process
         with open(f'logs/{self.client_name}.log', 'a+') as logfile:
             logging.info("Starting client...")
-            client_handle = subprocess.Popen(self.client_startup_args, stdout=logfile, stderr=logfile)
+            client_handle = ClientProcess(self.client_startup_args, stdout=logfile, stderr=logfile)
             logging.info("Client started.")
 
             while self.server.length_results() < number_commands:
@@ -346,6 +382,7 @@ class Controller:
             logging.info("Waiting for client to shutdown...")
             while client_handle.poll() == None:
                 pass
+            print(client_handle.memory_list, client_handle.cpu_list)
             logging.info("Client shutdown.")
 
         # removes results from queue
