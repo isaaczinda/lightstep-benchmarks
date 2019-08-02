@@ -24,32 +24,25 @@ client_args = {
 }
 
 
-""" Dictionaries created by urllib.parse.parse_qs looks like {key: [value], ...}
-This function take dictionaries of that format and makes them normal. """
-def _format_query_json(query_dict):
-    normal_dict = {}
-    for key in query_dict:
-        if len(query_dict[key]) == 1 and 'List' not in key:
-            normal_dict[key] = query_dict[key][0]
-        else:
-            normal_dict[key] = query_dict[key]
-
-    return normal_dict
 
 class CommandServer(HTTPServer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
         self._commands = []
-        self._results = []
+        self._num_results = 0
 
     def handle_timeout(self):
         raise Exception("Client waited too long to make a request.")
 
     """ Queues a command to be executed. """
-    def add_command(self, command):
+    def execute_command(self, command):
         assert isinstance(command, Command)
         self._commands.append(command)
+
+        while self._num_results < 1:
+            self.handle_request()
+        self._num_results = 0
 
     """ Pops the next command from the queue. """
     def next_command(self):
@@ -58,24 +51,14 @@ class CommandServer(HTTPServer):
 
         return self._commands.pop(0)
 
-    def length_results(self):
-        return len(self._results)
-
-    def pop_results(self):
-        results = copy.deepcopy(self._results)
-        self._results = []
-        return results
-
-    def add_result(self, result):
-        assert isinstance(result, Result)
-        self._results.append(result)
+    def report_result(self):
+        self._num_results += 1
 
 
 class RequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed_url = urlparse(self.path)
         self.path = parsed_url.path # redefine path so it excludes query string
-        self.query_json = _format_query_json(parse_qs(parsed_url.query))
 
         if self.path == "/control":
             self._handle_control()
@@ -99,8 +82,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
 
-        result = Result.from_dict(self.query_json)
-        self.server.add_result(result)
+        # no longer worry about parsing this !
+        # result = Result.from_dict(self.query_json)
+        self.server.report_result()
 
     def log_message(self, format, *args):
         return
@@ -142,13 +126,21 @@ class Command:
 
 ''' allows us to set spans_received even after initializing ...'''
 class Result:
-    def __init__(self, spans_sent, program_time, clock_time, memory, memory_list, cpu_list, spans_received=0):
-        self._spans_sent = spans_sent
-        self._program_time = program_time
-        self._clock_time = clock_time
-        self._memory = memory
-        self._memory_list = memory_list
-        self._cpu_list = cpu_list
+    def __init__(self,
+            spans_sent=0,
+            program_time=0,
+            clock_time=0,
+            memory=0,
+            memory_list=[],
+            cpu_list=[],
+            spans_received=0):
+
+        self.spans_sent = spans_sent
+        self.program_time = program_time
+        self.clock_time = clock_time
+        self.memory = memory
+        self.memory_list = memory_list
+        self.cpu_list = cpu_list
         self.spans_received = spans_received
 
     def __str__(self):
@@ -162,48 +154,11 @@ class Result:
 
         return ret
 
-    @staticmethod
-    def from_dict(result_dict, spans_received=0):
-        spans_sent = result_dict.get('SpansSent', 0)
-        program_time = result_dict.get('ProgramTime', 0)
-        clock_time = result_dict.get('ClockTime', 0)
-        memory = result_dict.get('Memory', 0)
-        memory_list = [int(m) for m in result_dict.get('MemoryList', [])]
-        cpu_list = [float(m) for m in result_dict.get('CPUList', [])]
-
-        return Result(int(spans_sent), float(program_time), float(clock_time), int(memory), memory_list, cpu_list, spans_received=int(spans_received))
-
-    """ Memory measurement taken at the end of the test, before flush """
-    @property
-    def memory(self):
-        return self._memory
-
-    """  List of memory measurements, taken every 1s """
-    @property
-    def memory_list(self):
-        return self._memory_list
-
-    @property
-    def cpu_list(self):
-        return self._cpu_list
-
     @property
     def spans_per_second(self):
         if self.spans_sent == 0:
             return 0
         return self.spans_sent / self.clock_time
-
-    @property
-    def program_time(self):
-        return self._program_time
-
-    @property
-    def clock_time(self):
-        return self._clock_time
-
-    @property
-    def spans_sent(self):
-        return self._spans_sent
 
     @property
     def dropped_spans(self):
@@ -213,7 +168,10 @@ class Result:
     def cpu_usage(self):
         return self.program_time / self.clock_time
 
+
+
 class ClientProcess(subprocess.Popen):
+    """ Client process is now not expected to send back anything. """
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -222,20 +180,50 @@ class ClientProcess(subprocess.Popen):
         self._cpu_list = []
         self._memory_list = []
 
-        self._save_stats_thread = Thread(target=self._save_stats, args=(self,))
+        self._save_stats_thread = Thread(target=self._save_stats, args=(self._cpu_list, self._memory_list))
         self._save_stats_thread.start()
+
+        # setup resource monitor & record starting time
+        self._resource_monitor = psutil.Process(pid=self.pid)
+        self._record_start_time()
+
+    def _record_start_time(self):
+        user, system, _, _ = self._resource_monitor.cpu_times()
+        self._start_program_time = user + system
+        self._start_clock_time = time.time()
+
+        print(f'start times: {user, system}')
 
     @property
     def cpu_list(self):
         with self._lock:
-            self._cpu_list.copy()
+            return self._cpu_list.copy()
 
     @property
     def memory_list(self):
         with self._lock:
-            self._memory_list.copy()
+            return self._memory_list.copy()
 
-    def _save_stats(self):
+    def calculate_runtime(self):
+        user, system, _, _ = self._resource_monitor.cpu_times()
+        self._program_time = (user + system) - self._start_program_time
+        self._clock_time = time.time() - self._start_clock_time
+
+    @property
+    def program_time(self):
+        if hasattr(self, "_program_time"):
+            return self._program_time
+        raise Exception("Can't get program_time without calling calculate_runtime")
+
+    @property
+    def clock_time(self):
+        if hasattr(self, "_clock_time"):
+            return self._clock_time
+        raise Exception("Can't get clock_time without calling calculate_runtime")
+
+    def _save_stats(self, cpu_list, memory_list):
+        # we use a separate resource monitor here because we don't want
+        # threading conflicts
         resource_monitor = psutil.Process(pid=self.pid)
         resource_monitor.cpu_percent() # throw away process CPU usage so far
 
@@ -250,9 +238,17 @@ class ClientProcess(subprocess.Popen):
             memory_usage = resource_monitor.memory_info()[0]
 
             with self._lock:
-                self._cpu_list.append(cpu_percent)
-                self._memory_list.append(memory_usage)
+                cpu_list.append(cpu_percent)
+                memory_list.append(memory_usage)
 
+    def get_results(self):
+        return Result(
+            program_time=self.program_time,
+            clock_time=self.clock_time,
+            memory_list=self.memory_list,
+            cpu_list=self.cpu_list,
+            memory=self.memory_list[-1] if self.memory_list else 0,
+        )
 
 class Controller:
     def __init__(self, client_name, target_cpu_usage=.7):
@@ -362,11 +358,8 @@ class Controller:
 
 
     def raw_benchmark(self, command):
-        # save commands to server, where they will be used to control stuff
-        self.server.add_command(command)
-        self.server.add_command(Command.exit())
+        spans_sent = command._repeat
 
-        number_commands = 2
 
         # startup test process
         with open(f'logs/{self.client_name}.log', 'a+') as logfile:
@@ -374,17 +367,27 @@ class Controller:
             client_handle = ClientProcess(self.client_startup_args, stdout=logfile, stderr=logfile)
             logging.info("Client started.")
 
-            while self.server.length_results() < number_commands:
-                self.server.handle_request()
+            # execute a few commands...
+            self.server.execute_command(command)
+
+            # could do a bit of reading here ?? get runtime and stuff ??
+            client_handle.calculate_runtime()
+
+            self.server.execute_command(Command.exit())
 
             # at this point, we have sent the exit command and received a response
             # wait for the client program to shutdown
             logging.info("Waiting for client to shutdown...")
             while client_handle.poll() == None:
                 pass
-            print(client_handle.memory_list, client_handle.cpu_list)
+
             logging.info("Client shutdown.")
 
         # removes results from queue
         # don't include that last result because it's from the exit command
-        return self.server.pop_results()[0]
+        results = client_handle.get_results()
+        results.spans_sent = spans_sent
+
+        print(results.program_time, results.clock_time)
+
+        return results

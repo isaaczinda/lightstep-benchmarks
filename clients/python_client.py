@@ -17,8 +17,8 @@ def work(units):
     for i in range(0, units):
         i *= i
 
-def send_result(result):
-    r = requests.get(f'http://localhost:{CONTROLLER_PORT}/result', params=result)
+def send_result():
+    r = requests.get(f'http://localhost:{CONTROLLER_PORT}/result')
 
 """ Special timer to measure process time and time spent as a result of this
 process' system calls.
@@ -54,7 +54,7 @@ def perform_work(command, tracer_name, port):
 
     # if exit is set to true, end the program
     if command['Exit']:
-        send_result({})
+        send_result()
         sys.exit()
 
     if command['Trace'] and tracer_name == "vanilla":
@@ -115,14 +115,11 @@ def perform_work(command, tracer_name, port):
         tracer.flush()
 
     cpu_time, clock_time = timer.stop()
-    send_result({
-        'ProgramTime': cpu_time,
-        'ClockTime': clock_time,
-        'SpansSent': spans_sent,
-        'Memory': memory,
-        'MemoryList': memory_list,
-        'CPUList': cpu_list,
-    })
+
+    print(f'cpu time: {cpu_time}, clock_time: {clock_time}')
+    print(memory_list, memory)
+
+    send_result()
 
 
 if __name__ == '__main__':
