@@ -20,7 +20,8 @@ CONTROLLER_PORT = 8023
 client_args = {
     'python': ['python3', 'clients/python_client.py', '8360', 'vanilla'],
     'python-cpp': ['python3', 'clients/python_client.py', '8360', 'cpp'],
-    'python-sidecar': ['python3', 'clients/python_client.py', '8024', 'vanilla']
+    'python-sidecar': ['python3', 'clients/python_client.py', '8024', 'vanilla'],
+    'js': ['node', 'clients/js_client.js'],
 }
 
 
@@ -192,8 +193,6 @@ class ClientProcess(subprocess.Popen):
         self._start_program_time = user + system
         self._start_clock_time = time.time()
 
-        print(f'start times: {user, system}')
-
     @property
     def cpu_list(self):
         with self._lock:
@@ -234,12 +233,17 @@ class ClientProcess(subprocess.Popen):
             if self.poll() != None:
                 return
 
-            cpu_percent = resource_monitor.cpu_percent()
-            memory_usage = resource_monitor.memory_info()[0]
+            try:
+                cpu_percent = resource_monitor.cpu_percent()
+                memory_usage = resource_monitor.memory_info()[0]
 
-            with self._lock:
-                cpu_list.append(cpu_percent)
-                memory_list.append(memory_usage)
+                with self._lock:
+                    cpu_list.append(cpu_percent)
+                    memory_list.append(memory_usage)
+            # if the child process has shut down, ignore because self.poll()
+            # will detect this soon
+            except psutil.AccessDenied:
+                pass
 
     def get_results(self):
         return Result(
@@ -295,28 +299,30 @@ class Controller:
             trace=False,
             sleep=work * self._sleep_per_work,
             work=work,
-            repeat=10000))
+            repeat=50000))
 
         return work * result.spans_per_second
 
     """ Finds sleep per work which leads to target CPU usage. """
     def _estimate_sleep_per_work(self, target_cpu_usage):
-        sleep_per_work = 25
-        p_constant = 10
+        sleep_per_work = 60
+        p_constant = 50
         work = 1000
 
-        for i in range(0, 20):
+        for i in range(0, 10):
             result = self.raw_benchmark(Command(
                 trace=False,
                 sleep=sleep_per_work * work,
                 work=work,
-                repeat=5000))
+                repeat=10000))
 
-            if abs(result.cpu_usage - target_cpu_usage) < .005: # within 1/2 a percent
+            if abs(result.cpu_usage - target_cpu_usage) < .01: # within 1 a percent
                 return sleep_per_work
 
             # make sure sleep per work is in range [1, 1000]
             sleep_per_work = np.clip(sleep_per_work + (result.cpu_usage - target_cpu_usage) * p_constant, 1, 1000)
+
+            print(result)
 
         return sleep_per_work
 
@@ -360,7 +366,6 @@ class Controller:
     def raw_benchmark(self, command):
         spans_sent = command._repeat
 
-
         # startup test process
         with open(f'logs/{self.client_name}.log', 'a+') as logfile:
             logging.info("Starting client...")
@@ -387,7 +392,5 @@ class Controller:
         # don't include that last result because it's from the exit command
         results = client_handle.get_results()
         results.spans_sent = spans_sent
-
-        print(results.program_time, results.clock_time)
 
         return results
